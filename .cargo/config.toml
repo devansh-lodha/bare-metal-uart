@@ -1,0 +1,7 @@
+[build]
+target = "aarch64-unknown-none"
+
+# This new section tells Rust to pass a specific argument to the linker
+# every time it builds for our bare-metal target.
+[target.aarch64-unknown-none]
+rustflags = ["-C", "link-arg=-Tlayout.ld"]

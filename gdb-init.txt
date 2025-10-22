@@ -1,0 +1,11 @@
+# 1. Connect to the OpenOCD server.
+target remote localhost:3333
+
+# 2. Reset the Pi and halt it at the very beginning.
+monitor reset init
+
+# 3. Load your program's symbols and code into the Pi's RAM.
+load
+
+# 4. Set the Program Counter to the start of our code.
+set $pc = 0x80000
