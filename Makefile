@@ -1,6 +1,8 @@
+# Makefile
+
 # NOTE: The indented lines below MUST start with a Tab character, not spaces.
 
-PROJECT_NAME = bare_metal_led
+PROJECT_NAME = bare_metal_uart
 TARGET_TRIPLE = aarch64-unknown-none
 CROSS_COMPILE = aarch64-elf-
 

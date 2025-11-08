@@ -105,7 +105,13 @@ global_asm!(
 
 
 // Physical addresses calculated from BAR + Offset
-const UART0_BASE: u64 = 0x1F00030000;
+// Note: From bcm2712-rpi-5-b.dts, the RP1 peripheral space starts at PCIe address 0,
+// which is mapped to RP1's internal address 0xc040000000. The DTS `ranges` property
+// then maps this to a CPU physical address. Given the complexity, we will use the
+// RP1 internal (PCIe bus) address directly since the MMU is off.
+// RP1 peripheral space appears at physical address 0x1f00000000 for the CPU.
+// UART0 is at offset 0x30000 inside RP1.
+const UART0_BASE: u64 = 0x1f00030000;
 
 // PL011 Register Offsets (from bcm2711-peripherals.pdf, Table 172)
 const UART_DR_OFFSET:   u64 = 0x00;
@@ -118,6 +124,7 @@ const UART_ICR_OFFSET:  u64 = 0x44;
 
 // Flag Register (FR) bits
 const UART_FR_TXFF: u32 = 1 << 5; // Transmit FIFO Full
+const UART_FR_RXFE: u32 = 1 << 4; // <<< NEW: Receive FIFO Empty
 
 // Line Control Register (LCRH) bits
 const UART_LCRH_WLEN8: u32 = 0b11 << 5; // 8-bit word length
@@ -172,13 +179,25 @@ fn uart_puts(s: &str) {
     }
 }
 
+// +++ NEW FUNCTION +++
+/// Receives a single character from UART0.
+fn uart_getc() -> char {
+    unsafe {
+        // Loop until the receive FIFO is no longer empty.
+        while read_volatile((UART0_BASE + UART_FR_OFFSET) as *mut u32) & UART_FR_RXFE != 0 {}
+        // Read the character from the data register. The top bits are status, so we mask with 0xFF.
+        (read_volatile((UART0_BASE + UART_DR_OFFSET) as *mut u32) & 0xFF) as u8 as char
+    }
+}
+
 
 #[no_mangle]
 pub extern "C" fn rust_main() -> ! {
     // --- GPIO Address and Bitmask Constants (from previous code) ---
-    const BCM2712_PCIE_BASE: u64 = 0x1f00000000;
-    const IO_BANK0_BASE: u64 = BCM2712_PCIE_BASE + 0xd0000;
-    const PADS_BANK0_BASE: u64 = BCM2712_PCIE_BASE + 0xf0000;
+    // Physical address for RP1 peripherals seen by the ARM cores.
+    const RP1_PERIPH_BASE: u64 = 0x1f00000000;
+    const IO_BANK0_BASE: u64 = RP1_PERIPH_BASE + 0xd0000;
+    const PADS_BANK0_BASE: u64 = RP1_PERIPH_BASE + 0xf0000;
     
     // GPIO 14 (TXD0)
     const GPIO14_CTRL_ADDR: u64 = IO_BANK0_BASE + 0x074;
@@ -224,7 +243,21 @@ pub extern "C" fn rust_main() -> ! {
         // --- Step 2: Initialize and use the UART ---
         uart_init();
         uart_puts("Hello, world from bare-metal Rust on Raspberry Pi 5!\r\n");
+        uart_puts("Now in echo mode...\r\n");
     }
+    
+    // +++ MODIFIED: Main echo loop +++
+    loop {
+        // Read a character
+        let c = uart_getc();
 
-    loop {}
+        // Echo the character back.
+        // Also, handle the enter key: terminals send '\r' (carriage return),
+        // but we want to see a new line, so we send back '\r\n'.
+        if c == '\r' {
+            uart_puts("\r\n");
+        } else {
+            uart_putc(c);
+        }
+    }
 }
