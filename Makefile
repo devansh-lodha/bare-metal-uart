@@ -1,27 +1,23 @@
-# Makefile
-
-# NOTE: The indented lines below MUST start with a Tab character, not spaces.
-
 PROJECT_NAME = bare_metal_uart
 TARGET_TRIPLE = aarch64-unknown-none
 CROSS_COMPILE = aarch64-elf-
 
 GDB = $(CROSS_COMPILE)gdb
 OPENOCD = openocd
-OBJCOPY = $(CROSS_COMPILE)objcopy
 
 KERNEL_ELF_DEBUG = target/$(TARGET_TRIPLE)/debug/$(PROJECT_NAME)
 HALT_STUB_IMG = halt_stub/halt_stub.img
 
-OPENOCD_INTERFACE_CFG = debug-helper/cmsis-dap.cfg
-OPENOCD_TARGET_CFG = debug-helper/raspberrypi5.cfg
+OPENOCD_INTERFACE_CFG = debug/cmsis-dap.cfg
+OPENOCD_TARGET_CFG = debug/raspberrypi5.cfg
+GDB_INIT_FILE = debug/gdb-init.txt
 
 .PHONY: all build openocd-pi5 gdb-pi5 clean halt_stub
 
 all: build
 
 build:
-	@echo "--- Building Rust Kernel for Debug ---"
+	@echo "--- Building Rust Kernel ---"
 	@cargo build
 
 halt_stub: $(HALT_STUB_IMG)
@@ -38,7 +34,7 @@ openocd-pi5:
 
 gdb-pi5: build
 	@echo "--- Launching GDB ---"
-	@$(GDB) -x gdb-init.txt $(KERNEL_ELF_DEBUG)
+	@$(GDB) -x $(GDB_INIT_FILE) $(KERNEL_ELF_DEBUG)
 
 clean:
 	@cargo clean

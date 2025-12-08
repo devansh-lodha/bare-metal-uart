@@ -3,9 +3,19 @@
 version = 4
 
 [[package]]
-name = "bare_metal_uart"
-version = "0.1.0"
+name = "aarch64-cpu"
+version = "9.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac42a04a61c19fc8196dd728022a784baecc5d63d7e256c01ad1b3fbfab26287"
 dependencies = [
+ "tock-registers",
+]
+
+[[package]]
+name = "bare_metal_uart"
+version = "0.2.0"
+dependencies = [
+ "aarch64-cpu",
  "tock-registers",
 ]
 

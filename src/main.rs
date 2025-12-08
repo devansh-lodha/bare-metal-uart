@@ -3,261 +3,167 @@
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-use core::ptr::{read_volatile, write_volatile};
+use aarch64_cpu::registers::*;
+use tock_registers::interfaces::Readable;
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+mod uart;
+mod mmu;
 
-global_asm!(
-    ".section .text.boot",
-    ".global _start",
-    "_start:",
-    // --- Step 1: Read CPU ID to check if we are the primary core (Core 0) ---
-    "   mrs  x0, mpidr_el1",
-    "   and  x0, x0, #3", 
-    "   cbz  x0, .L_core0_main", 
-    // --- If not Core 0, put this core into a holding pattern ---
-    ".L_secondary_core_sleep:",
-    "   wfe",
-    "   b    .L_secondary_core_sleep",
+global_asm!(include_str!("start.s"));
 
-    ".L_core0_main:",
-    // --- Step 2: Set up a temporary stack right below the kernel load address ---
-    "   ldr  x0, =_start",
-    "   mov  sp, x0",
+// -----------------------------------------------------------------------------
+// Educational Helpers
+// -----------------------------------------------------------------------------
 
-    // --- Step 3: Clean and Invalidate the Data Cache (D-Cache) ---
-    "   mrs  x0, clidr_el1",      
-    "   and  x0, x0, #0x7000000", 
-    "   lsr  x0, x0, #23",        
-    "   cbz  x0, .L_finished_cache_cleaning", 
-    "   mov  x10, x0",            
-
-    "   mov  x1, #0",             
-    ".L_cache_level_loop:",
-    "   add  x2, x1, x1, lsr #1", 
-    "   lsl  x0, x1, #1",     // x0 = level * 2 (for CSSELR shift)
-    "   msr  csselr_el1, x0",     
-    "   isb",                    
-    "   mrs  x0, ccsidr_el1",     
-    "   and  x2, x0, #7",         
-    "   add  x2, x2, #4",         
-    "   ubfx x3, x0, #3, #10",    
-    "   ubfx x4, x0, #13, #15",   
+/// Uses the hardware Address Translation (AT) instruction to ask the MMU:
+/// "What Physical Address does this Virtual Address map to?"
+/// Returns: Some(PhysicalAddress) or None if it faults (unmapped).
+fn hardware_resolve_addr(va: u64) -> Option<u64> {
+    use aarch64_cpu::asm::barrier;
     
-    ".L_cache_set_loop:",
-    "   mov  x5, x3",
-    ".L_cache_way_loop:",
-    "   lsl  x6, x5, #30",
-    "   lsl  x7, x1, #1",
-    "   lsl  x9, x4, x2",
-    "   orr  x6, x6, x7",
-    "   orr  x6, x6, x9",
-    "   dc   cisw, x6",
-    "   subs x5, x5, #1",
-    "   bge  .L_cache_way_loop",
-    "   subs x4, x4, #1",
-    "   bge  .L_cache_set_loop",
+    // SAFETY: AT instruction is safe to execute at EL1. 
+    // It does not change memory, only updates PAR_EL1.
+    unsafe {
+        core::arch::asm!("at s1e1r, {}", in(reg) va);
+        barrier::isb(barrier::SY);
+    }
 
-    "   add  x1, x1, #1",
-    "   cmp  x1, x10",
-    "   b.lt .L_cache_level_loop",
+    // Read result from Physical Address Register (PAR_EL1)
+    let par = PAR_EL1.get();
 
-    ".L_finished_cache_cleaning:",
-    "   dsb  ish",
+    // Check F bit (Bit 0). If 1, translation failed.
+    if (par & 1) == 1 {
+        return None;
+    }
 
-    // --- Step 4: Disable MMU, Caches, and Invalidate TLBs ---
-    "   ic   iallu",
-    "   tlbi vmalle1is",
-    "   dsb  ish",
-    "   isb",
-
-    "   mrs  x0, sctlr_el1",
-    "   bic  x0, x0, #(1 << 0)",
-    "   bic  x0, x0, #(1 << 2)",
-    "   bic  x0, x0, #(1 << 12)",
-    "   msr  sctlr_el1, x0",
-    "   isb",
-
-    // --- Step 5: Jump to Rust code after clearing BSS ---
-    "   ldr  x0, =__bss_start",
-    "   ldr  x1, =__bss_end",
-    "   sub  x1, x1, x0",
-    "   bl   memset_zero",
-    "   bl   rust_main",
+    // Extract Output Address (Bits 47:12) + add offset from VA (Bits 11:0)
+    // The PAR holds the page base. We must add the page offset.
+    let page_offset = va & 0xFFF; // 4KB offset mask (generic safe bet)
+    let pa_base = par & 0x0000_FFFF_FFFF_F000;
     
-    // --- Loop forever if rust_main returns ---
-    "loop:",
-    "   wfe",
-    "   b    loop",
-
-    // Helper function to zero memory for the BSS section.
-    "memset_zero:",
-    "   cbz  x1, .L_memset_zero_end",
-    "   str  xzr, [x0], #8",
-    "   sub  x1, x1, #8",
-    "   b    memset_zero",
-    ".L_memset_zero_end:",
-    "   ret",
-);
-
-
-// Physical addresses calculated from BAR + Offset
-// Note: From bcm2712-rpi-5-b.dts, the RP1 peripheral space starts at PCIe address 0,
-// which is mapped to RP1's internal address 0xc040000000. The DTS `ranges` property
-// then maps this to a CPU physical address. Given the complexity, we will use the
-// RP1 internal (PCIe bus) address directly since the MMU is off.
-// RP1 peripheral space appears at physical address 0x1f00000000 for the CPU.
-// UART0 is at offset 0x30000 inside RP1.
-const UART0_BASE: u64 = 0x1f00030000;
-
-// PL011 Register Offsets (from bcm2711-peripherals.pdf, Table 172)
-const UART_DR_OFFSET:   u64 = 0x00;
-const UART_FR_OFFSET:   u64 = 0x18;
-const UART_IBRD_OFFSET: u64 = 0x24;
-const UART_FBRD_OFFSET: u64 = 0x28;
-const UART_LCRH_OFFSET: u64 = 0x2c;
-const UART_CR_OFFSET:   u64 = 0x30;
-const UART_ICR_OFFSET:  u64 = 0x44;
-
-// Flag Register (FR) bits
-const UART_FR_TXFF: u32 = 1 << 5; // Transmit FIFO Full
-const UART_FR_RXFE: u32 = 1 << 4; // <<< NEW: Receive FIFO Empty
-
-// Line Control Register (LCRH) bits
-const UART_LCRH_WLEN8: u32 = 0b11 << 5; // 8-bit word length
-const UART_LCRH_FEN:   u32 = 1 << 4;    // Enable FIFOs
-
-// Control Register (CR) bits
-const UART_CR_UARTEN: u32 = 1 << 0; // UART Enable
-const UART_CR_TXE:    u32 = 1 << 8; // Transmit Enable
-const UART_CR_RXE:    u32 = 1 << 9; // Receive Enable
-
-/// Initializes UART0 for 115200 baud communication.
-fn uart_init() {
-    unsafe {
-        // --- Step 1: Disable the UART to configure it ---
-        write_volatile((UART0_BASE + UART_CR_OFFSET) as *mut u32, 0);
-
-        // --- Step 2: Set the Baud Rate ---
-        // Formula: BAUDDIV = UARTCLK / (16 * Baud Rate)
-        // We assume UARTCLK is 48MHz from the DTS.
-        // BAUDDIV = 48,000,000 / (16 * 115200) = 26.0416...
-        // IBRD = 26
-        // FBRD = integer((0.0416 * 64) + 0.5) = 3
-        write_volatile((UART0_BASE + UART_IBRD_OFFSET) as *mut u32, 26);
-        write_volatile((UART0_BASE + UART_FBRD_OFFSET) as *mut u32, 3);
-
-        // --- Step 3: Configure the Line Control ---
-        // Enable FIFOs and set 8-bit word length, no parity, 1 stop bit.
-        write_volatile((UART0_BASE + UART_LCRH_OFFSET) as *mut u32, UART_LCRH_FEN | UART_LCRH_WLEN8);
-
-        // --- Step 4: Clear all interrupts ---
-        write_volatile((UART0_BASE + UART_ICR_OFFSET) as *mut u32, 0x7FF);
-
-        // --- Step 5: Enable the UART, TX, and RX ---
-        write_volatile((UART0_BASE + UART_CR_OFFSET) as *mut u32, UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE);
-    }
+    Some(pa_base | page_offset)
 }
 
-/// Transmits a single character over UART0.
-fn uart_putc(c: char) {
-    unsafe {
-        // Loop until the transmit FIFO is no longer full.
-        while read_volatile((UART0_BASE + UART_FR_OFFSET) as *mut u32) & UART_FR_TXFF != 0 {}
-        // Write the character to the data register.
-        write_volatile((UART0_BASE + UART_DR_OFFSET) as *mut u32, c as u32);
-    }
-}
+fn print_system_status() {
+    uart::console_print("\r\n--- SYSTEM STATUS INSPECTION ---\r\n");
 
-/// Transmits a string slice over UART0.
-fn uart_puts(s: &str) {
-    for c in s.chars() {
-        uart_putc(c);
-    }
-}
+    // 1. EL Check
+    let el = CurrentEL.read(CurrentEL::EL);
+    uart::console_print(" [1] Current Exception Level: EL");
+    uart::print_dec(el);
+    uart::console_print("\r\n");
 
-// +++ NEW FUNCTION +++
-/// Receives a single character from UART0.
-fn uart_getc() -> char {
-    unsafe {
-        // Loop until the receive FIFO is no longer empty.
-        while read_volatile((UART0_BASE + UART_FR_OFFSET) as *mut u32) & UART_FR_RXFE != 0 {}
-        // Read the character from the data register. The top bits are status, so we mask with 0xFF.
-        (read_volatile((UART0_BASE + UART_DR_OFFSET) as *mut u32) & 0xFF) as u8 as char
+    // 2. PA Range
+    let pa_range = ID_AA64MMFR0_EL1.read(ID_AA64MMFR0_EL1::PARange);
+    uart::console_print(" [2] Physical Address Width:  ");
+    match pa_range {
+        0 => uart::console_print("32 bits (4GB)\r\n"),
+        1 => uart::console_print("36 bits (64GB)\r\n"),
+        2 => uart::console_print("40 bits (1TB)\r\n"),
+        3 => uart::console_print("42 bits (4TB)\r\n"),
+        4 => uart::console_print("44 bits (16TB)\r\n"),
+        5 => uart::console_print("48 bits (256TB)\r\n"),
+        _ => uart::console_print("Unknown\r\n"),
     }
-}
 
+    // 3. Cache/MMU
+    let mmu_on = SCTLR_EL1.is_set(SCTLR_EL1::M);
+    uart::console_print(" [3] SCTLR_EL1: ");
+    if mmu_on { uart::console_print("MMU:[ON]  "); } else { uart::console_print("MMU:[OFF] "); }
+    if SCTLR_EL1.is_set(SCTLR_EL1::I) { uart::console_print("I-Cache:[ON]  "); }
+    if SCTLR_EL1.is_set(SCTLR_EL1::C) { uart::console_print("D-Cache:[ON]"); }
+    uart::console_print("\r\n");
+
+    // 4. Granule & VA Size
+    let tg0 = TCR_EL1.read(TCR_EL1::TG0);
+    uart::console_print(" [4] TCR_EL1:   Granule=");
+    match tg0 {
+        1 => uart::console_print("64KB"),
+        0 => uart::console_print("4KB"),
+        2 => uart::console_print("16KB"),
+        _ => uart::console_print("?"),
+    }
+    
+    let t0sz = TCR_EL1.read(TCR_EL1::T0SZ);
+    let va_bits = 64 - t0sz;
+    uart::console_print("  VirtualBits=");
+    uart::print_dec(va_bits);
+    uart::console_print("\r\n");
+
+    // 5. Evidence-Based Verification
+    uart::console_print(" [5] MMU Verification (AT Instruction Probe):\r\n");
+    
+    // Probe Kernel Entry (should be 1:1 mapped)
+    let kernel_va = 0x80000;
+    uart::console_print("     - Probing Kernel VA (0x80000)...  Result: PA 0x");
+    if let Some(pa) = hardware_resolve_addr(kernel_va) {
+        uart::print_hex(pa);
+        if pa == kernel_va {
+            uart::console_print(" [MATCH - Identity Mapped]\r\n");
+        } else {
+            uart::console_print(" [RE-MAPPED]\r\n");
+        }
+    } else {
+        uart::console_print(" [FAULT - Not Mapped!]\r\n");
+    }
+
+    // Probe UART Base (should be mapped)
+    let uart_va = 0x1f_0003_0000;
+    uart::console_print("     - Probing UART VA   (0x");
+    uart::print_hex(uart_va);
+    uart::console_print(")...  Result: PA 0x");
+    if let Some(pa) = hardware_resolve_addr(uart_va) {
+        uart::print_hex(pa);
+        uart::console_print(" [OK]\r\n");
+    } else {
+        uart::console_print(" [FAULT - Not Mapped!]\r\n");
+    }
+
+    // Probe Random High Address (should fail)
+    let bad_va = 0x0FFF_FFFF_FFFF_0000; 
+    uart::console_print("     - Probing Bad VA    (0x");
+    uart::print_hex(bad_va);
+    uart::console_print(")...  Result: ");
+    if let Some(_) = hardware_resolve_addr(bad_va) {
+        uart::console_print("PA Found (Unexpected)\r\n");
+    } else {
+        uart::console_print("Translation Fault (Expected - Secure)\r\n");
+    }
+
+    uart::console_print("--------------------------------\r\n");
+}
 
 #[no_mangle]
 pub extern "C" fn rust_main() -> ! {
-    // --- GPIO Address and Bitmask Constants (from previous code) ---
-    // Physical address for RP1 peripherals seen by the ARM cores.
-    const RP1_PERIPH_BASE: u64 = 0x1f00000000;
-    const IO_BANK0_BASE: u64 = RP1_PERIPH_BASE + 0xd0000;
-    const PADS_BANK0_BASE: u64 = RP1_PERIPH_BASE + 0xf0000;
-    
-    // GPIO 14 (TXD0)
-    const GPIO14_CTRL_ADDR: u64 = IO_BANK0_BASE + 0x074;
-    const PADS14_CTRL_ADDR: u64 = PADS_BANK0_BASE + 0x03c;
-    // GPIO 15 (RXD0)
-    const GPIO15_CTRL_ADDR: u64 = IO_BANK0_BASE + 0x07c;
-    const PADS15_CTRL_ADDR: u64 = PADS_BANK0_BASE + 0x040;
-
-    // --- Pad Control Bits ---
-    const BIT_PADS_OD: u32 = 1 << 7;  // Output Disable
-    const BIT_PADS_IE: u32 = 1 << 6;  // Input Enable
-    const BIT_PADS_PUE: u32 = 1 << 3; // Pull-Up Enable
-
-    // --- IO Control Fields ---
-    const FUNCSEL_FIELD_LSB: u32 = 0;
-    const FUNCSEL_FIELD_MASK: u32 = 0x1F << FUNCSEL_FIELD_LSB;
-    const FUNC_UART0: u32 = 4;
-
     unsafe {
-        // --- Step 1: Configure GPIO Pins (The Two Locks) ---
-        
-        // Configure GPIO 14 as UART0 TX
-        let mut pads14_val = read_volatile(PADS14_CTRL_ADDR as *mut u32);
-        pads14_val &= !BIT_PADS_OD; // LOCK 1: Enable output driver
-        write_volatile(PADS14_CTRL_ADDR as *mut u32, pads14_val);
-
-        let mut io14_val = read_volatile(GPIO14_CTRL_ADDR as *mut u32);
-        io14_val &= !FUNCSEL_FIELD_MASK; // Clear the function field
-        io14_val |= FUNC_UART0 << FUNCSEL_FIELD_LSB; // LOCK 2: Set function to UART0
-        write_volatile(GPIO14_CTRL_ADDR as *mut u32, io14_val);
-
-        // Configure GPIO 15 as UART0 RX
-        let mut pads15_val = read_volatile(PADS15_CTRL_ADDR as *mut u32);
-        pads15_val |= BIT_PADS_IE; // LOCK 1: Enable input buffer
-        pads15_val |= BIT_PADS_PUE; // Enable pull-up as per DTS
-        write_volatile(PADS15_CTRL_ADDR as *mut u32, pads15_val);
-
-        let mut io15_val = read_volatile(GPIO15_CTRL_ADDR as *mut u32);
-        io15_val &= !FUNCSEL_FIELD_MASK; // Clear the function field
-        io15_val |= FUNC_UART0 << FUNCSEL_FIELD_LSB; // LOCK 2: Set function to UART0
-        write_volatile(GPIO15_CTRL_ADDR as *mut u32, io15_val);
-        
-        // --- Step 2: Initialize and use the UART ---
-        uart_init();
-        uart_puts("Hello, world from bare-metal Rust on Raspberry Pi 5!\r\n");
-        uart_puts("Now in echo mode...\r\n");
+        uart::init();
+        mmu::init();
     }
-    
-    // +++ MODIFIED: Main echo loop +++
-    loop {
-        // Read a character
-        let c = uart_getc();
 
-        // Echo the character back.
-        // Also, handle the enter key: terminals send '\r' (carriage return),
-        // but we want to see a new line, so we send back '\r\n'.
+    uart::console_print("\r\n\r\n");
+    uart::console_print("========================================\r\n");
+    uart::console_print("   RASPBERRY PI 5 - BARE METAL RUST     \r\n");
+    uart::console_print("========================================\r\n");
+
+    print_system_status();
+
+    uart::console_print("Kernel Initialized. Echo Loop Active.\r\n");
+
+    loop {
+        let c = uart::getc();
         if c == '\r' {
-            uart_puts("\r\n");
+            uart::console_print("\r\n");
         } else {
-            uart_putc(c);
+            uart::putc(c);
         }
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    unsafe { uart::init(); }
+    uart::console_print("\r\n[KERNEL PANIC]\r\n");
+    loop {
+        aarch64_cpu::asm::wfe();
     }
 }

@@ -1,10 +1,20 @@
 [package]
 name = "bare_metal_uart"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+authors = ["Devansh Lodha"]
+
+[[bin]]
+name = "bare_metal_uart"
+path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
-tock-registers = "0.8.x"
+tock-registers = "0.8.1"
+aarch64-cpu = "9.4.0"
 
 [profile.release]
 panic = "abort"
+lto = true
+codegen-units = 1

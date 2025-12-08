@@ -1,0 +1,16 @@
+# 1. Connect
+target remote localhost:3333
+
+# 2. Reset and Halt
+monitor reset init
+
+# 3. Load the ELF file
+# This sends the sections marked LOAD (like .text.boot) to the Pi's RAM.
+load
+
+# 4. Set PC to start address (0x80000)
+# We force this just in case the ELF entry point isn't picked up correctly.
+set $pc = 0x80000
+
+# 5. Continue execution
+continue
